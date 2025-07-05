@@ -1,34 +1,45 @@
-// src/App.js
-import React, { useState, useEffect } from 'react';
-import { Upload, Eye, MessageCircle, Clock, CheckCircle, XCircle, Users, FileText, Plus, Send, Download, LogOut, Share2 } from 'lucide-react';
-import { auth, db, storage, supabase } from './lib/supabase';
+import React, { useState, useEffect, useCallback } from 'react';
+import { supabase, auth, db } from './lib/supabase';
 import Auth from './components/Auth';
-import FileUpload from './components/FileUpload';
 import ClientReview from './components/ClientReview';
+import FileUpload from './components/FileUpload';
+import Modal from './components/Modal';
+import Notification from './components/Notification';
+import Comments from './components/Comments';
+import { LogOut, Plus, Share2, Upload, Clock, FileText, CheckCircle, Users, ArrowLeft, Download, Eye } from 'lucide-react';
 
 function App() {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [currentView, setCurrentView] = useState('dashboard');
   const [currentProject, setCurrentProject] = useState(null);
-  const [currentAsset, setCurrentAsset] = useState(null);
-  const [showFileUpload, setShowFileUpload] = useState(false);
   
-  // Client review detection
   const [isClientReview, setIsClientReview] = useState(false);
   const [clientReviewData, setClientReviewData] = useState(null);
-  
-  // Real data from database
-  const [projects, setProjects] = useState([]);
-  const [commentInputs, setCommentInputs] = useState({}); // Store comments per asset
-  const [newProject, setNewProject] = useState({ name: '', client: '', dueDate: '' });
-  const [showNewProjectModal, setShowNewProjectModal] = useState(false);
 
-  // Check for client review URL on app load
-  useEffect(() => {
+  const [projects, setProjects] = useState([]);
+  const [showNewProjectModal, setShowNewProjectModal] = useState(false);
+  const [showFileUpload, setShowFileUpload] = useState(false);
+  const [showShareModal, setShowShareModal] = useState(false);
+  const [projectToShare, setProjectToShare] = useState(null);
+  
+  const [notification, setNotification] = useState({ show: false, message: '', type: 'success' });
+
+  const showNotification = (message, type = 'success') => {
+    setNotification({ show: true, message, type });
+    setTimeout(() => setNotification({ show: false, message: '', type: 'success' }), 3000);
+  };
+
+  const checkUser = useCallback(async () => {
+    const { data: { session } } = await auth.getSession();
+    setUser(session?.user ?? null);
+    setLoading(false);
+  }, []);
+
+  const handleInitialLoad = useCallback(async () => {
     const path = window.location.pathname;
     const reviewMatch = path.match(/^\/review\/([^\/]+)\/([^\/]+)$/);
-    
+
     if (reviewMatch) {
       const [, projectId, accessToken] = reviewMatch;
       setIsClientReview(true);
@@ -36,235 +47,179 @@ function App() {
       setLoading(false);
       return;
     }
+    
+    await checkUser();
+  }, [checkUser]);
 
-    // Normal app authentication check
-    checkUser();
-  }, []);
-
-  const checkUser = async () => {
-    try {
-      const { data: { user } } = await auth.getCurrentUser();
-      setUser(user);
-      
-      if (user) {
-        await loadProjects(user.id);
-      }
-    } catch (error) {
-      console.error('Error checking user:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Listen for auth changes (only for normal app, not client review)
   useEffect(() => {
-    if (isClientReview) return;
+    handleInitialLoad();
 
-    const { data: { subscription } } = auth.onAuthStateChange((event, session) => {
-      setUser(session?.user || null);
-      if (session?.user) {
-        loadProjects(session.user.id);
-      } else {
-        setProjects([]);
+    const { data: { subscription } } = auth.onAuthStateChange((_event, session) => {
+      if (!isClientReview) {
+        setUser(session?.user ?? null);
       }
     });
 
     return () => subscription.unsubscribe();
-  }, [isClientReview]);
+  }, [handleInitialLoad, isClientReview]);
+  
+  // Fetch projects and set up real-time subscriptions
+  useEffect(() => {
+    if (user) {
+      db.getProjects(user.id).then(({ data, error }) => {
+        if (error) {
+          showNotification('Error loading projects', 'error');
+          console.error('Error loading projects:', error);
+        } else {
+          setProjects(data || []);
+        }
+      });
 
-  // Load projects from database
-  const loadProjects = async (userId) => {
-    try {
-      const { data, error } = await db.getProjects(userId);
-      if (error) throw error;
-      setProjects(data || []);
-    } catch (error) {
-      console.error('Error loading projects:', error);
+      const projectSubscription = supabase
+        .channel('public:projects')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'projects' }, payload => {
+            console.log('Project change received!', payload);
+            if (payload.new?.agency_user_id === user.id) {
+                setProjects(currentProjects => {
+                    const projectExists = currentProjects.some(p => p.id === payload.new.id);
+                    if (payload.eventType === 'INSERT') {
+                        return [payload.new, ...currentProjects];
+                    }
+                    if (payload.eventType === 'UPDATE') {
+                        return currentProjects.map(p => p.id === payload.new.id ? {...p, ...payload.new} : p);
+                    }
+                    return currentProjects;
+                });
+            }
+        })
+        .subscribe();
+      
+      const assetSubscription = supabase
+        .channel('public:assets')
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'assets' }, payload => {
+            console.log('Asset insert received!', payload);
+            setProjects(currentProjects => 
+                currentProjects.map(p => 
+                    p.id === payload.new.project_id
+                    ? { ...p, assets: [...(p.assets || []), payload.new] }
+                    : p
+                )
+            );
+            if (currentProject?.id === payload.new.project_id) {
+                setCurrentProject(p => ({ ...p, assets: [...(p.assets || []), payload.new] }));
+            }
+        })
+        .subscribe();
+
+      const commentSubscription = supabase
+        .channel('public:comments')
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'comments' }, payload => {
+            console.log('Comment insert received!', payload);
+            const newComment = payload.new;
+            setProjects(currentProjects => 
+                currentProjects.map(p => ({
+                    ...p,
+                    assets: p.assets?.map(asset => 
+                        asset.id === newComment.asset_id
+                        ? { ...asset, comments: [...(asset.comments || []), newComment] }
+                        : asset
+                    ) || []
+                }))
+            );
+            if (currentProject) {
+                const isRelevantProject = currentProject.assets.some(a => a.id === newComment.asset_id);
+                if (isRelevantProject) {
+                    setCurrentProject(p => ({
+                        ...p,
+                        assets: p.assets.map(asset => 
+                            asset.id === newComment.asset_id
+                            ? { ...asset, comments: [...(asset.comments || []), newComment] }
+                            : asset
+                        )
+                    }));
+                }
+            }
+        })
+        .subscribe();
+
+      return () => {
+        supabase.removeChannel(projectSubscription);
+        supabase.removeChannel(assetSubscription);
+        supabase.removeChannel(commentSubscription);
+      };
     }
-  };
+  }, [user, currentProject]);
 
-  // Create new project
-  const createProject = async () => {
-    if (!newProject.name.trim() || !newProject.client.trim() || !user) return;
+
+  const createProject = async (newProjectData) => {
+    if (!newProjectData.name.trim() || !newProjectData.client.trim() || !user) return;
     
     try {
       const projectData = {
-        name: newProject.name.trim(),
-        client_company: newProject.client.trim(),
+        name: newProjectData.name.trim(),
+        client_company: newProjectData.client.trim(),
         agency_user_id: user.id,
-        due_date: newProject.dueDate || null,
+        due_date: newProjectData.dueDate || null,
         status: 'setup'
       };
 
-      const { data, error } = await db.createProject(projectData);
+      const { error } = await db.createProject(projectData);
       if (error) throw error;
-
-      // Add to local state
-      setProjects(prev => [data[0], ...prev]);
-      setNewProject({ name: '', client: '', dueDate: '' });
+      
       setShowNewProjectModal(false);
+      showNotification('Project created successfully!');
     } catch (error) {
       console.error('Error creating project:', error);
-      alert('Error creating project. Please try again.');
+      showNotification('Error creating project. Please try again.', 'error');
     }
   };
 
-  // Add comment to asset
-  const addComment = async (assetId) => {
-    const commentText = commentInputs[assetId]?.trim();
-    if (!commentText || !user) return;
-    
-    try {
-      const commentData = {
-        asset_id: assetId,
-        author_name: user.user_metadata?.full_name || user.email,
-        author_email: user.email,
-        author_type: 'agency',
-        content: commentText
-      };
-
-      const { data, error } = await db.addComment(commentData);
-      if (error) throw error;
-
-      // Update local state
-      setProjects(prev => prev.map(project => ({
-        ...project,
-        assets: project.assets?.map(asset => 
-          asset.id === assetId 
-            ? { ...asset, comments: [...(asset.comments || []), data[0]] }
-            : asset
-        ) || []
-      })));
-
-      // Update current project if it matches
-      if (currentProject) {
-        setCurrentProject(prev => ({
-          ...prev,
-          assets: prev.assets?.map(asset => 
-            asset.id === assetId 
-              ? { ...asset, comments: [...(asset.comments || []), data[0]] }
-              : asset
-          ) || []
-        }));
-      }
-
-      // Clear the specific comment input
-      setCommentInputs(prev => ({
-        ...prev,
-        [assetId]: ''
-      }));
-    } catch (error) {
-      console.error('Error adding comment:', error);
-      alert('Error adding comment. Please try again.');
-    }
-  };
-
-  // Handle comment input change
-  const handleCommentChange = (assetId, value) => {
-    setCommentInputs(prev => ({
-      ...prev,
-      [assetId]: value
-    }));
-  };
-
-  // Update project status
   const updateProjectStatus = async (projectId, newStatus) => {
     try {
-      const { data, error } = await supabase
-        .from('projects')
-        .update({ status: newStatus })
-        .eq('id', projectId)
-        .select()
-        .single();
-
+      const { error } = await db.updateProjectStatus(projectId, newStatus);
       if (error) throw error;
-
-      // Update local state
-      setProjects(prev => prev.map(project => 
-        project.id === projectId ? { ...project, status: newStatus } : project
-      ));
-
-      if (currentProject && currentProject.id === projectId) {
+      
+      // Optimistic update for immediate UI feedback
+      const updater = (p) => p.id === projectId ? { ...p, status: newStatus } : p;
+      setProjects(prev => prev.map(updater));
+      if (currentProject?.id === projectId) {
         setCurrentProject(prev => ({ ...prev, status: newStatus }));
       }
+
+      showNotification('Project status updated.');
     } catch (error) {
       console.error('Error updating project status:', error);
-      alert('Error updating project status. Please try again.');
+      showNotification('Error updating project status.', 'error');
     }
   };
 
-  // Handle asset creation
-  const handleAssetCreated = (newAsset) => {
-    // Add asset to the current project in projects state
-    setProjects(prev => prev.map(project => 
-      project.id === currentProject.id 
-        ? { 
-            ...project, 
-            assets: [...(project.assets || []), newAsset]
-          }
-        : project
-    ));
-    
-    // Update current project as well
-    setCurrentProject(prev => ({
-      ...prev,
-      assets: [...(prev.assets || []), newAsset]
-    }));
-  };
-
-  // Generate client approval link
-  const generateClientLink = async (projectId) => {
+  const generateClientLink = async (stakeholderDetails) => {
+    if (!projectToShare) return;
     try {
-      // Generate a secure token for client access
-      const accessToken = Math.random().toString(36).substring(2) + Date.now().toString(36);
+      const { data, error } = await db.createStakeholder(projectToShare.id, stakeholderDetails);
+      if (error) throw error;
       
-      // Save the token to the database for verification
-      const { error } = await supabase
-        .from('project_stakeholders')
-        .insert([{
-          project_id: projectId,
-          email: 'client@placeholder.com', // In real app, get from form
-          name: 'Client Stakeholder',
-          role: 'Reviewer',
-          access_token: accessToken,
-          can_approve: true
-        }]);
-
-      if (error) {
-        console.error('Error creating access token:', error);
-        // Continue anyway with local token
-      }
+      const accessToken = data[0].access_token;
+      const clientLink = `${window.location.origin}/review/${projectToShare.id}/${accessToken}`;
       
-      // Create client review link
-      const clientLink = `${window.location.origin}/review/${projectId}/${accessToken}`;
-      
-      // Copy to clipboard
       await navigator.clipboard.writeText(clientLink);
-      alert('Client review link copied to clipboard!\n\nShare this link with your client:\n' + clientLink);
+      showNotification('Client review link copied to clipboard!');
+      setShowShareModal(false);
+      setProjectToShare(null);
     } catch (error) {
       console.error('Error generating client link:', error);
-      // Fallback for browsers that don't support clipboard API
-      const accessToken = Math.random().toString(36).substring(2) + Date.now().toString(36);
-      const clientLink = `${window.location.origin}/review/${projectId}/${accessToken}`;
-      prompt('Copy this link to share with your client:', clientLink);
+      showNotification('Error generating link. Please try again.', 'error');
     }
   };
 
-  // Handle user sign out
   const handleSignOut = async () => {
-    try {
-      await auth.signOut();
-      setUser(null);
-      setProjects([]);
-      setCurrentView('dashboard');
-      setCurrentProject(null);
-      setCurrentAsset(null);
-    } catch (error) {
-      console.error('Error signing out:', error);
-    }
+    await auth.signOut();
+    setUser(null);
+    setProjects([]);
+    setCurrentView('dashboard');
+    setCurrentProject(null);
   };
 
-  // Show loading spinner
   if (loading) {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
@@ -273,51 +228,29 @@ function App() {
     );
   }
 
-  // Show client review if accessed via review link
-  if (isClientReview && clientReviewData) {
-    return (
-      <ClientReview
-        projectId={clientReviewData.projectId}
-        accessToken={clientReviewData.accessToken}
-        onBack={() => {
-          setIsClientReview(false);
-          setClientReviewData(null);
-          window.history.pushState({}, '', '/');
-        }}
-      />
-    );
-  }
-
-  // Show auth form if not logged in (normal app access)
-  if (!user && !isClientReview) {
-    return <Auth onAuthSuccess={setUser} />;
-  }
-
-  // Return early if in client review mode (handled above)
   if (isClientReview) {
-    return null;
+    return <ClientReview {...clientReviewData} />;
+  }
+
+  if (!user) {
+    return <Auth onAuthSuccess={checkUser} showNotification={showNotification} />;
   }
 
   const getStatusColor = (status) => {
-    switch (status) {
-      case 'approved': return 'text-green-600 bg-green-100';
-      case 'pending': return 'text-yellow-600 bg-yellow-100';
-      case 'commented': return 'text-blue-600 bg-blue-100';
-      case 'rejected': return 'text-red-600 bg-red-100';
-      default: return 'text-gray-600 bg-gray-100';
-    }
+    const colors = {
+      'setup': 'bg-gray-100 text-gray-800',
+      'in-progress': 'bg-blue-100 text-blue-800',
+      'in-review': 'bg-yellow-100 text-yellow-800',
+      'revisions': 'bg-purple-100 text-purple-800',
+      'completed': 'bg-green-100 text-green-800',
+      'cancelled': 'bg-red-100 text-red-800',
+    };
+    return colors[status] || colors['setup'];
   };
 
-  // Mock function for handling approvals (will be implemented with client access)
-  const handleApproval = (assetId, status, comment = '') => {
-    // This will be implemented when we add client approval functionality
-    console.log('Approval handled:', { assetId, status, comment });
-  };
-
-  // Dashboard View
   const DashboardView = () => (
-    <div className="p-6">
-      <div className="flex justify-between items-center mb-6">
+    <div className="p-4 sm:p-6">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 gap-4">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Agency Dashboard</h1>
           <p className="text-gray-600">Welcome back, {user.user_metadata?.full_name || user.email}</p>
@@ -325,114 +258,47 @@ function App() {
         <div className="flex gap-2">
           <button 
             onClick={() => setShowNewProjectModal(true)}
-            className="bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-blue-700"
+            className="bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-blue-700 transition-colors"
           >
             <Plus size={16} /> New Project
           </button>
           <button 
             onClick={handleSignOut}
-            className="bg-gray-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-gray-700"
+            className="bg-gray-200 text-gray-800 px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-gray-300 transition-colors"
           >
             <LogOut size={16} /> Sign Out
           </button>
         </div>
       </div>
 
-      {/* Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
-        <div className="bg-white p-4 rounded-lg border">
-          <div className="flex items-center gap-2">
-            <Clock className="text-yellow-500" size={20} />
-            <span className="text-sm text-gray-600">Active Projects</span>
-          </div>
-          <div className="text-2xl font-bold text-gray-900">{projects.length}</div>
-        </div>
-        <div className="bg-white p-4 rounded-lg border">
-          <div className="flex items-center gap-2">
-            <FileText className="text-blue-500" size={20} />
-            <span className="text-sm text-gray-600">Total Assets</span>
-          </div>
-          <div className="text-2xl font-bold text-gray-900">
-            {projects.reduce((acc, p) => acc + (p.assets?.length || 0), 0)}
-          </div>
-        </div>
-        <div className="bg-white p-4 rounded-lg border">
-          <div className="flex items-center gap-2">
-            <CheckCircle className="text-green-500" size={20} />
-            <span className="text-sm text-gray-600">Completed</span>
-          </div>
-          <div className="text-2xl font-bold text-gray-900">
-            {projects.filter(p => p.status === 'completed').length}
-          </div>
-        </div>
-        <div className="bg-white p-4 rounded-lg border">
-          <div className="flex items-center gap-2">
-            <Users className="text-purple-500" size={20} />
-            <span className="text-sm text-gray-600">Clients</span>
-          </div>
-          <div className="text-2xl font-bold text-gray-900">
-            {new Set(projects.map(p => p.client_company)).size}
-          </div>
-        </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        {/* Stats Cards */}
+        <div className="bg-white p-4 rounded-lg border"><div className="flex items-center gap-2"><Clock className="text-yellow-500" size={20} /><span className="text-sm text-gray-600">Active Projects</span></div><div className="text-2xl font-bold text-gray-900">{projects.filter(p => p.status !== 'completed' && p.status !== 'cancelled').length}</div></div>
+        <div className="bg-white p-4 rounded-lg border"><div className="flex items-center gap-2"><FileText className="text-blue-500" size={20} /><span className="text-sm text-gray-600">Total Assets</span></div><div className="text-2xl font-bold text-gray-900">{projects.reduce((acc, p) => acc + (p.assets?.length || 0), 0)}</div></div>
+        <div className="bg-white p-4 rounded-lg border"><div className="flex items-center gap-2"><CheckCircle className="text-green-500" size={20} /><span className="text-sm text-gray-600">Completed</span></div><div className="text-2xl font-bold text-gray-900">{projects.filter(p => p.status === 'completed').length}</div></div>
+        <div className="bg-white p-4 rounded-lg border"><div className="flex items-center gap-2"><Users className="text-purple-500" size={20} /><span className="text-sm text-gray-600">Clients</span></div><div className="text-2xl font-bold text-gray-900">{new Set(projects.map(p => p.client_company)).size}</div></div>
       </div>
 
-      {/* Projects List */}
       <div className="bg-white rounded-lg border">
-        <div className="p-4 border-b">
-          <h2 className="text-lg font-semibold">Your Projects</h2>
-        </div>
-        
+        <div className="p-4 border-b"><h2 className="text-lg font-semibold">Your Projects</h2></div>
         {projects.length === 0 ? (
-          <div className="p-8 text-center">
-            <div className="text-gray-400 mb-4">
-              <FileText size={48} className="mx-auto" />
-            </div>
-            <h3 className="text-lg font-medium text-gray-900 mb-2">No projects yet</h3>
-            <p className="text-gray-600 mb-4">Create your first project to start managing client approvals</p>
-            <button 
-              onClick={() => setShowNewProjectModal(true)}
-              className="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700"
-            >
-              Create Project
-            </button>
-          </div>
+          <div className="p-8 text-center"><div className="text-gray-400 mb-4"><FileText size={48} className="mx-auto" /></div><h3 className="text-lg font-medium text-gray-900 mb-2">No projects yet</h3><p className="text-gray-600 mb-4">Create your first project to start managing client approvals</p><button onClick={() => setShowNewProjectModal(true)} className="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700">Create Project</button></div>
         ) : (
           <div className="divide-y">
             {projects.map(project => (
-              <div key={project.id} className="p-4 hover:bg-gray-50">
-                <div className="flex justify-between items-start">
+              <div key={project.id} className="p-4 hover:bg-gray-50 transition-colors">
+                <div className="flex flex-col sm:flex-row justify-between items-start">
                   <div>
-                    <h4 className="font-medium text-lg">{project.name}</h4>
+                    <h4 className="font-medium text-lg text-gray-800">{project.name}</h4>
                     <p className="text-sm text-gray-600">{project.client_company}</p>
-                    <p className="text-sm text-gray-500">
-                      Created: {new Date(project.created_at).toLocaleDateString()}
-                      {project.due_date && ` • Due: ${new Date(project.due_date).toLocaleDateString()}`}
-                    </p>
-                    <div className="mt-2 flex items-center gap-2">
-                      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
-                        project.status === 'completed' ? 'bg-green-100 text-green-800' :
-                        project.status === 'in-review' ? 'bg-yellow-100 text-yellow-800' :
-                        'bg-gray-100 text-gray-800'
-                      }`}>
-                        {project.status.replace('-', ' ')}
-                      </span>
-                      {project.assets && project.assets.length > 0 && (
-                        <span className="text-xs text-gray-500">
-                          {project.assets.length} asset{project.assets.length !== 1 ? 's' : ''}
-                        </span>
-                      )}
+                    <div className="mt-2 flex items-center gap-2 flex-wrap">
+                      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(project.status)}`}>{project.status.replace('-', ' ')}</span>
+                      <span className="text-xs text-gray-500">{project.assets?.length || 0} asset(s)</span>
+                      {project.due_date && <span className="text-xs text-gray-500">Due: {new Date(project.due_date).toLocaleDateString()}</span>}
                     </div>
                   </div>
-                  <div className="flex gap-2">
-                    <button 
-                      onClick={() => {
-                        setCurrentProject(project);
-                        setCurrentView('project');
-                      }}
-                      className="text-blue-600 hover:text-blue-800 text-sm"
-                    >
-                      View Details
-                    </button>
+                  <div className="flex gap-2 mt-3 sm:mt-0">
+                    <button onClick={() => { setCurrentProject(project); setCurrentView('project'); }} className="text-blue-600 hover:text-blue-800 text-sm font-medium">View Details</button>
                   </div>
                 </div>
               </div>
@@ -440,256 +306,59 @@ function App() {
           </div>
         )}
       </div>
-
-      {/* New Project Modal */}
-      {showNewProjectModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-lg p-6 w-full max-w-md">
-            <h2 className="text-lg font-semibold mb-4">Create New Project</h2>
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Project Name</label>
-                <input
-                  type="text"
-                  value={newProject.name}
-                  onChange={(e) => setNewProject(prev => ({ ...prev, name: e.target.value }))}
-                  className="w-full p-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  placeholder="Brand Identity Project"
-                  autoFocus
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Client Company</label>
-                <input
-                  type="text"
-                  value={newProject.client}
-                  onChange={(e) => setNewProject(prev => ({ ...prev, client: e.target.value }))}
-                  className="w-full p-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  placeholder="TechCorp Inc."
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Due Date (Optional)</label>
-                <input
-                  type="date"
-                  value={newProject.dueDate}
-                  onChange={(e) => setNewProject(prev => ({ ...prev, dueDate: e.target.value }))}
-                  className="w-full p-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-            </div>
-            <div className="flex gap-2 mt-6">
-              <button
-                onClick={createProject}
-                disabled={!newProject.name.trim() || !newProject.client.trim()}
-                className="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                Create Project
-              </button>
-              <button
-                onClick={() => {
-                  setShowNewProjectModal(false);
-                  setNewProject({ name: '', client: '', dueDate: '' });
-                }}
-                className="bg-gray-200 text-gray-800 px-4 py-2 rounded hover:bg-gray-300"
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 
-  // Project Detail View
   const ProjectView = () => {
     if (!currentProject) return null;
     
     return (
-      <div className="p-6">
+      <div className="p-4 sm:p-6">
         <div className="flex items-center gap-4 mb-6">
-          <button 
-            onClick={() => setCurrentView('dashboard')}
-            className="text-blue-600 hover:text-blue-800"
-          >
-            ← Back to Dashboard
-          </button>
-          <h1 className="text-2xl font-bold text-gray-900">{currentProject.name}</h1>
-          <span className="text-gray-500">|</span>
-          <span className="text-gray-600">{currentProject.client_company}</span>
+          <button onClick={() => setCurrentView('dashboard')} className="text-blue-600 hover:text-blue-800 flex items-center gap-1"><ArrowLeft size={16}/> Back to Dashboard</button>
         </div>
-
-        {/* Project Info */}
+        
         <div className="bg-white rounded-lg border p-4 mb-6">
-          <div className="flex justify-between items-start">
+          <div className="flex flex-col sm:flex-row justify-between items-start gap-4">
             <div>
-              <h2 className="text-lg font-semibold mb-4">Project Information</h2>
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                <div>
-                  <span className="text-sm text-gray-500">Status</span>
-                  <select
-                    value={currentProject.status}
-                    onChange={(e) => updateProjectStatus(currentProject.id, e.target.value)}
-                    className="block w-full mt-1 border border-gray-300 rounded-md px-3 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  >
-                    <option value="setup">Setup</option>
-                    <option value="in-progress">In Progress</option>
-                    <option value="filming">Filming</option>
-                    <option value="editing">Editing</option>
-                    <option value="in-review">In Review</option>
-                    <option value="revisions">Revisions</option>
-                    <option value="completed">Completed</option>
-                    <option value="cancelled">Cancelled</option>
-                  </select>
-                </div>
-                <div>
-                  <span className="text-sm text-gray-500">Created</span>
-                  <p className="font-medium">{new Date(currentProject.created_at).toLocaleDateString()}</p>
-                </div>
-                {currentProject.due_date && (
-                  <div>
-                    <span className="text-sm text-gray-500">Due Date</span>
-                    <p className="font-medium">{new Date(currentProject.due_date).toLocaleDateString()}</p>
-                  </div>
-                )}
-                <div>
-                  <span className="text-sm text-gray-500">Assets</span>
-                  <p className="font-medium">{currentProject.assets?.length || 0}</p>
-                </div>
+              <h1 className="text-2xl font-bold text-gray-900">{currentProject.name}</h1>
+              <p className="text-gray-600">{currentProject.client_company}</p>
+              <div className="mt-2">
+                <select value={currentProject.status} onChange={(e) => updateProjectStatus(currentProject.id, e.target.value)} className={`text-xs font-medium rounded-full px-3 py-1 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 appearance-none ${getStatusColor(currentProject.status)}`}>
+                  <option value="setup">Setup</option><option value="in-progress">In Progress</option><option value="filming">Filming</option><option value="editing">Editing</option><option value="in-review">In Review</option><option value="revisions">Revisions</option><option value="completed">Completed</option><option value="cancelled">Cancelled</option>
+                </select>
               </div>
             </div>
-            <button
-              onClick={() => generateClientLink(currentProject.id)}
-              className="bg-green-600 text-white px-4 py-2 rounded flex items-center gap-2 hover:bg-green-700"
-            >
-              <Share2 size={16} /> Share with Client
-            </button>
+            <div className="flex gap-2">
+              <button onClick={() => { setProjectToShare(currentProject); setShowShareModal(true); }} className="bg-green-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-green-700 transition-colors"><Share2 size={16} /> Share</button>
+              <button onClick={() => setShowFileUpload(true)} className="bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-blue-700 transition-colors"><Upload size={16} /> Upload Asset</button>
+            </div>
           </div>
         </div>
 
-        {/* Assets Section */}
         <div className="bg-white rounded-lg border">
-          <div className="p-4 border-b">
-            <div className="flex justify-between items-center">
-              <h2 className="text-lg font-semibold">Assets</h2>
-              <button 
-                onClick={() => setShowFileUpload(true)}
-                className="bg-blue-600 text-white px-4 py-2 rounded flex items-center gap-2 hover:bg-blue-700"
-              >
-                <Upload size={16} /> Upload Asset
-              </button>
-            </div>
-          </div>
-          
+          <div className="p-4 border-b"><h2 className="text-lg font-semibold">Assets</h2></div>
           {!currentProject.assets || currentProject.assets.length === 0 ? (
-            <div className="p-8 text-center">
-              <div className="text-gray-400 mb-4">
-                <Upload size={48} className="mx-auto" />
-              </div>
-              <h3 className="text-lg font-medium text-gray-900 mb-2">No assets yet</h3>
-              <p className="text-gray-600 mb-4">Upload your first asset to start the approval process</p>
-              <button 
-                onClick={() => setShowFileUpload(true)}
-                className="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700"
-              >
-                Upload Asset
-              </button>
-            </div>
+            <div className="p-8 text-center"><div className="text-gray-400 mb-4"><Upload size={48} className="mx-auto" /></div><h3 className="text-lg font-medium text-gray-900 mb-2">No assets yet</h3><p className="text-gray-600 mb-4">Upload your first asset to start the approval process</p><button onClick={() => setShowFileUpload(true)} className="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700">Upload Asset</button></div>
           ) : (
             <div className="divide-y">
               {currentProject.assets.map(asset => (
-                <div key={asset.id} className="p-4">
-                  <div className="flex justify-between items-start mb-4">
-                    <div className="flex-1">
-                      <h3 className="font-medium text-lg">{asset.name}</h3>
-                      <p className="text-sm text-gray-600">
-                        Uploaded: {new Date(asset.created_at).toLocaleDateString()}
-                      </p>
-                      {asset.description && (
-                        <p className="text-sm text-gray-500 mt-1">{asset.description}</p>
-                      )}
-                      <div className="flex items-center gap-2 mt-2">
-                        <span className="text-xs bg-gray-100 text-gray-700 px-2 py-1 rounded">
-                          {asset.file_type}
-                        </span>
-                        {asset.file_size && (
-                          <span className="text-xs text-gray-500">
-                            {(asset.file_size / 1024 / 1024).toFixed(2)} MB
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                    <div className="flex gap-2 ml-4">
-                      {asset.file_url && (
-                        <a
-                          href={asset.file_url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-blue-600 hover:text-blue-800 text-sm flex items-center gap-1"
-                        >
-                          <Download size={14} /> Download
-                        </a>
-                      )}
+                <div key={asset.id} className="p-4 grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div>
+                    <h3 className="font-medium text-lg">{asset.name}</h3>
+                    <p className="text-sm text-gray-500 mt-1">{asset.description || 'No description.'}</p>
+                    {asset.file_type === 'image' && asset.file_url ? (
+                      <div className="mt-4 border rounded-lg overflow-hidden"><img src={asset.file_url} alt={asset.name} className="max-w-full h-auto" /></div>
+                    ) : (
+                      <div className="mt-4 p-4 bg-gray-50 rounded border text-center"><p className="font-medium">{asset.name}</p><p className="text-sm text-gray-500">{asset.file_type}</p></div>
+                    )}
+                    <div className="flex gap-4 mt-2">
+                      <a href={asset.file_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:text-blue-800 text-sm flex items-center gap-1"><Eye size={14} /> Preview</a>
+                      <a href={asset.file_url} download className="text-blue-600 hover:text-blue-800 text-sm flex items-center gap-1"><Download size={14} /> Download</a>
                     </div>
                   </div>
-
-                  {/* Asset Preview */}
-                  {asset.file_type === 'image' && asset.file_url && (
-                    <div className="mb-4">
-                      <img 
-                        src={asset.file_url} 
-                        alt={asset.name} 
-                        className="max-w-md max-h-64 rounded border object-contain"
-                        onError={(e) => {
-                          e.target.style.display = 'none';
-                        }}
-                      />
-                    </div>
-                  )}
-                  
-                  {/* Comments */}
-                  {asset.comments && asset.comments.length > 0 && (
-                    <div className="mb-4">
-                      <h4 className="font-medium mb-2">Comments:</h4>
-                      <div className="space-y-2">
-                        {asset.comments.map(comment => (
-                          <div key={comment.id} className="p-2 bg-blue-50 rounded">
-                            <div className="flex justify-between items-start mb-1">
-                              <span className="font-medium text-sm">{comment.author_name}</span>
-                              <span className="text-xs text-gray-500">
-                                {new Date(comment.created_at).toLocaleDateString()}
-                              </span>
-                            </div>
-                            <p className="text-sm">{comment.content}</p>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Add Comment */}
-                  <div className="flex gap-2">
-                    <input
-                      key={`comment-${asset.id}`}
-                      type="text"
-                      value={commentInputs[asset.id] || ''}
-                      onChange={(e) => handleCommentChange(asset.id, e.target.value)}
-                      onKeyPress={(e) => {
-                        if (e.key === 'Enter') {
-                          addComment(asset.id);
-                        }
-                      }}
-                      placeholder="Add a comment..."
-                      className="flex-1 p-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    />
-                    <button 
-                      onClick={() => addComment(asset.id)}
-                      disabled={!commentInputs[asset.id]?.trim()}
-                      className="bg-blue-600 text-white px-4 py-2 rounded flex items-center gap-2 hover:bg-blue-700 disabled:opacity-50"
-                    >
-                      <Send size={14} /> Send
-                    </button>
+                  <div>
+                    <Comments asset={asset} user={user} showNotification={showNotification} />
                   </div>
                 </div>
               ))}
@@ -699,18 +368,66 @@ function App() {
       </div>
     );
   };
+  
+  const NewProjectModal = () => {
+    const [name, setName] = useState('');
+    const [client, setClient] = useState('');
+    const [dueDate, setDueDate] = useState('');
+    
+    const handleSubmit = (e) => {
+      e.preventDefault();
+      createProject({ name, client, dueDate });
+      setName(''); setClient(''); setDueDate('');
+    };
+
+    return (
+      <Modal show={showNewProjectModal} onClose={() => setShowNewProjectModal(false)} title="Create New Project">
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div><label className="block text-sm font-medium text-gray-700">Project Name</label><input type="text" value={name} onChange={(e) => setName(e.target.value)} className="w-full p-2 border border-gray-300 rounded mt-1" required /></div>
+          <div><label className="block text-sm font-medium text-gray-700">Client Company</label><input type="text" value={client} onChange={(e) => setClient(e.target.value)} className="w-full p-2 border border-gray-300 rounded mt-1" required /></div>
+          <div><label className="block text-sm font-medium text-gray-700">Due Date (Optional)</label><input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} className="w-full p-2 border border-gray-300 rounded mt-1" /></div>
+          <div className="flex justify-end gap-2 pt-4"><button type="button" onClick={() => setShowNewProjectModal(false)} className="bg-gray-200 text-gray-800 px-4 py-2 rounded">Cancel</button><button type="submit" className="bg-blue-600 text-white px-4 py-2 rounded">Create</button></div>
+        </form>
+      </Modal>
+    );
+  };
+
+  const ShareProjectModal = () => {
+    const [name, setName] = useState('');
+    const [email, setEmail] = useState('');
+    const [role, setRole] = useState('Reviewer');
+
+    const handleSubmit = (e) => {
+      e.preventDefault();
+      generateClientLink({ name, email, role });
+      setName(''); setEmail(''); setRole('Reviewer');
+    };
+
+    return (
+      <Modal show={showShareModal} onClose={() => setShowShareModal(false)} title="Share Project">
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <p className="text-sm text-gray-600">Generate a secure link for a client stakeholder to review assets.</p>
+          <div><label className="block text-sm font-medium text-gray-700">Stakeholder Name</label><input type="text" value={name} onChange={(e) => setName(e.target.value)} className="w-full p-2 border border-gray-300 rounded mt-1" required /></div>
+          <div><label className="block text-sm font-medium text-gray-700">Stakeholder Email</label><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} className="w-full p-2 border border-gray-300 rounded mt-1" required /></div>
+          <div><label className="block text-sm font-medium text-gray-700">Role</label><input type="text" value={role} onChange={(e) => setRole(e.target.value)} className="w-full p-2 border border-gray-300 rounded mt-1" required /></div>
+          <div className="flex justify-end gap-2 pt-4"><button type="button" onClick={() => setShowShareModal(false)} className="bg-gray-200 text-gray-800 px-4 py-2 rounded">Cancel</button><button type="submit" className="bg-blue-600 text-white px-4 py-2 rounded">Generate & Copy Link</button></div>
+        </form>
+      </Modal>
+    );
+  };
 
   return (
     <div className="min-h-screen bg-gray-50">
-      {currentView === 'dashboard' && <DashboardView />}
-      {currentView === 'project' && <ProjectView />}
-      
-      {/* File Upload Modal */}
+      <Notification {...notification} onClose={() => setNotification(prev => ({ ...prev, show: false }))} />
+      {currentView === 'dashboard' ? <DashboardView /> : <ProjectView />}
+      <NewProjectModal />
+      <ShareProjectModal />
       {showFileUpload && currentProject && (
         <FileUpload
           projectId={currentProject.id}
-          onAssetCreated={handleAssetCreated}
+          onAssetCreated={() => showNotification('Asset uploaded successfully!')}
           onClose={() => setShowFileUpload(false)}
+          showNotification={showNotification}
         />
       )}
     </div>
