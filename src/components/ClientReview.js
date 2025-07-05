@@ -1,9 +1,8 @@
-// src/components/ClientReview.js
 import React, { useState, useEffect, useCallback } from 'react';
 import { supabase, db } from '../lib/supabase';
 import Comments from './Comments';
 import Notification from './Notification';
-import { CheckCircle, XCircle, MessageCircle, Download, Eye, ArrowLeft } from 'lucide-react';
+import { CheckCircle, XCircle, MessageCircle, Download, Eye } from 'lucide-react';
 
 const ClientReview = ({ projectId, accessToken }) => {
   const [project, setProject] = useState(null);
@@ -15,28 +14,24 @@ const ClientReview = ({ projectId, accessToken }) => {
 
   const showNotification = (message, type = 'success') => {
     setNotification({ show: true, message, type });
-    setTimeout(() => setNotification({ show: false, message: '', type: 'success' }), 3000);
+    setTimeout(() => setNotification({ show: false, message: '', type: 'success' }), 4000);
   };
 
   const loadProjectData = useCallback(async () => {
     setLoading(true);
     try {
-      const { data: stakeholderData, error: stakeholderError } = await db.getStakeholderByToken(projectId, accessToken);
-      if (stakeholderError || !stakeholderData) {
-        throw new Error('Invalid access token or project not found. Please check your link.');
-      }
-      setStakeholder(stakeholderData);
+      const { data, error: rpcError } = await db.getProjectForReview(projectId, accessToken);
 
-      // IMPORTANT: In a production app, you would use an Edge Function to securely fetch project data
-      // using the validated stakeholder identity, not expose it to an anonymous query.
-      // The RLS policies must allow this.
-      const { data, error: projectError } = await db.getProjectForReview(projectId);
-      if (projectError) throw projectError;
+      if (rpcError || !data) {
+        throw new Error(rpcError?.message || 'Invalid access token or project not found. Please check your link.');
+      }
       
-      setProject(data);
+      setStakeholder(data.stakeholder);
+      setProject(data.project);
+
     } catch (err) {
       console.error('Error loading project for review:', err);
-      setError(err.message || 'Project not found or access denied');
+      setError(err.message);
     } finally {
       setLoading(false);
     }
@@ -46,72 +41,41 @@ const ClientReview = ({ projectId, accessToken }) => {
     loadProjectData();
   }, [loadProjectData]);
 
-  // Set up real-time subscriptions for comments and approvals
   useEffect(() => {
-    if (!project || !stakeholder) return;
+    if (!project) return;
+    
+    const handleDatabaseChange = (payload) => {
+        console.log('Realtime change received:', payload);
+        loadProjectData(); // Refetch all data to ensure consistency
+    };
 
-    const commentSubscription = supabase
-      .channel(`public:comments:project=${project.id}`)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'comments' }, payload => {
-        const newComment = payload.new;
-        setProject(currentProject => ({
-            ...currentProject,
-            assets: currentProject.assets.map(asset => 
-                asset.id === newComment.asset_id
-                ? { ...asset, comments: [...(asset.comments || []), newComment] }
-                : asset
-            )
-        }));
-      })
-      .subscribe();
-
-    const approvalSubscription = supabase
-      .channel(`public:approvals:project=${project.id}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'approvals' }, payload => {
-        const changedApproval = payload.new || payload.old;
-        setProject(currentProject => ({
-            ...currentProject,
-            assets: currentProject.assets.map(asset => {
-                if (asset.id === changedApproval.asset_id) {
-                    const otherApprovals = asset.approvals.filter(a => a.stakeholder_id !== changedApproval.stakeholder_id);
-                    return { ...asset, approvals: [...otherApprovals, payload.new] };
-                }
-                return asset;
-            })
-        }));
-      })
-      .subscribe();
+    const commentsChannel = supabase.channel(`public:comments:project=${project.id}`).on('postgres_changes', { event: '*', schema: 'public', table: 'comments' }, handleDatabaseChange).subscribe();
+    const approvalsChannel = supabase.channel(`public:approvals:project=${project.id}`).on('postgres_changes', { event: '*', schema: 'public', table: 'approvals' }, handleDatabaseChange).subscribe();
 
     return () => {
-      supabase.removeChannel(commentSubscription);
-      supabase.removeChannel(approvalSubscription);
+        supabase.removeChannel(commentsChannel);
+        supabase.removeChannel(approvalsChannel);
     };
-  }, [project, stakeholder]);
+  }, [project, loadProjectData]);
 
   const handleApproval = async (assetId, status, feedback) => {
     setSubmitting(true);
     try {
-      // Add comment if feedback is provided
-      if (feedback?.trim()) {
-        const { error: commentError } = await db.addComment({
-          asset_id: assetId,
-          author_name: stakeholder.name,
-          author_email: stakeholder.email,
-          author_type: 'client',
-          content: feedback.trim()
-        });
-        if (commentError) throw commentError;
-      }
+      const { error: rpcError } = await db.submitClientFeedback(
+        assetId,
+        stakeholder.id,
+        accessToken,
+        status,
+        feedback
+      );
 
-      // Add or update approval status
-      const { error: approvalError } = await db.setApproval(assetId, stakeholder.id, status, feedback);
-      if (approvalError) throw approvalError;
+      if (rpcError) throw rpcError;
 
       const statusText = status === 'approved' ? 'approved' : status === 'rejected' ? 'rejected' : 'changes requested for';
       showNotification(`Asset ${statusText}. The agency has been notified.`, 'success');
     } catch (err) {
       console.error('Error submitting approval:', err);
-      showNotification('Error submitting approval. Please try again.', 'error');
+      showNotification(err.message || 'Error submitting approval. Please try again.', 'error');
     } finally {
       setSubmitting(false);
     }
@@ -173,7 +137,7 @@ const ClientReview = ({ projectId, accessToken }) => {
                       ) : (
                         <div className="mb-4 p-4 bg-gray-50 rounded border text-center"><p className="font-medium">{asset.name}</p><p className="text-sm text-gray-500">{asset.file_type}</p></div>
                       )}
-                      <div className="flex gap-4"><a href={asset.file_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:text-blue-800 flex items-center gap-1 text-sm"><Eye size={14} /> View Full Size</a><a href={asset.file_url} download className="text-blue-600 hover:text-blue-800 flex items-center gap-1 text-sm"><Download size={14} /> Download</a></div>
+                      <div className="flex gap-4"><a href={asset.file_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:text-blue-800 flex items-center gap-1 text-sm"><Eye size={14} /> Preview</a><a href={asset.file_url} download target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:text-blue-800 flex items-center gap-1 text-sm"><Download size={14} /> Download</a></div>
                     </div>
 
                     {/* Feedback & Actions */}

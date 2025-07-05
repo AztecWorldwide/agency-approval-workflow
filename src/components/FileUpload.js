@@ -1,6 +1,6 @@
 import React, { useState, useCallback } from 'react';
 import { useDropzone } from 'react-dropzone';
-import { Upload, File, X } from 'lucide-react';
+import { Upload, File } from 'lucide-react';
 import { supabase, db } from '../lib/supabase';
 import Modal from './Modal';
 
@@ -50,7 +50,7 @@ const FileUpload = ({ projectId, onAssetCreated, onClose, showNotification }) =>
         name: finalName,
         description: assetDetails.description.trim() || null,
         file_url: publicUrl,
-        file_type: fileToUpload.type.startsWith('image/') ? 'image' : 'document',
+        file_type: fileToUpload.type.startsWith('image/') ? 'image' : (fileToUpload.type.startsWith('video/') ? 'video' : 'document'),
         file_size: fileToUpload.size,
         created_by: user.id,
         stage: 'review'
@@ -61,7 +61,6 @@ const FileUpload = ({ projectId, onAssetCreated, onClose, showNotification }) =>
       if (assetError) throw new Error(`Failed to create asset record: ${assetError.message}`);
       
       if (onAssetCreated) onAssetCreated(assetResult[0]);
-      showNotification('Upload successful!', 'success');
       onClose();
       
     } catch (error) {
@@ -74,18 +73,14 @@ const FileUpload = ({ projectId, onAssetCreated, onClose, showNotification }) =>
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     maxFiles: 1,
-    maxSize: 25 * 1024 * 1024, // 25MB limit
+    maxSize: 50 * 1024 * 1024, // 50MB limit
     accept: {
       'image/*': ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'],
       'application/pdf': ['.pdf'],
       'text/plain': ['.txt'],
-      'video/*': ['.mp4', '.mov']
+      'video/*': ['.mp4', '.mov', '.avi']
     }
   });
-
-  const handleDetailsChange = (field, value) => {
-    setAssetDetails(prev => ({ ...prev, [field]: value }));
-  };
 
   return (
     <Modal show={true} onClose={onClose} title="Upload New Asset">
@@ -110,7 +105,7 @@ const FileUpload = ({ projectId, onAssetCreated, onClose, showNotification }) =>
             ) : (
               <div>
                 <p className="text-sm font-medium text-gray-900">{isDragActive ? 'Drop file here' : 'Click or drag to upload'}</p>
-                <p className="text-xs text-gray-500">Max 25MB</p>
+                <p className="text-xs text-gray-500">Max 50MB</p>
               </div>
             )}
           </div>

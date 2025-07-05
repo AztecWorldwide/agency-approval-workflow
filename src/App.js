@@ -27,7 +27,7 @@ function App() {
 
   const showNotification = (message, type = 'success') => {
     setNotification({ show: true, message, type });
-    setTimeout(() => setNotification({ show: false, message: '', type: 'success' }), 3000);
+    setTimeout(() => setNotification({ show: false, message: '', type: 'success' }), 4000);
   };
 
   const checkUser = useCallback(async () => {
@@ -53,142 +53,78 @@ function App() {
 
   useEffect(() => {
     handleInitialLoad();
-
     const { data: { subscription } } = auth.onAuthStateChange((_event, session) => {
       if (!isClientReview) {
         setUser(session?.user ?? null);
       }
     });
-
     return () => subscription.unsubscribe();
   }, [handleInitialLoad, isClientReview]);
   
-  // Fetch projects and set up real-time subscriptions
-  useEffect(() => {
-    if (user) {
-      db.getProjects(user.id).then(({ data, error }) => {
-        if (error) {
-          showNotification('Error loading projects', 'error');
-          console.error('Error loading projects:', error);
-        } else {
-          setProjects(data || []);
-        }
-      });
-
-      const projectSubscription = supabase
-        .channel('public:projects')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'projects' }, payload => {
-            console.log('Project change received!', payload);
-            if (payload.new?.agency_user_id === user.id) {
-                setProjects(currentProjects => {
-                    const projectExists = currentProjects.some(p => p.id === payload.new.id);
-                    if (payload.eventType === 'INSERT') {
-                        return [payload.new, ...currentProjects];
-                    }
-                    if (payload.eventType === 'UPDATE') {
-                        return currentProjects.map(p => p.id === payload.new.id ? {...p, ...payload.new} : p);
-                    }
-                    return currentProjects;
-                });
-            }
-        })
-        .subscribe();
-      
-      const assetSubscription = supabase
-        .channel('public:assets')
-        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'assets' }, payload => {
-            console.log('Asset insert received!', payload);
-            setProjects(currentProjects => 
-                currentProjects.map(p => 
-                    p.id === payload.new.project_id
-                    ? { ...p, assets: [...(p.assets || []), payload.new] }
-                    : p
-                )
-            );
-            if (currentProject?.id === payload.new.project_id) {
-                setCurrentProject(p => ({ ...p, assets: [...(p.assets || []), payload.new] }));
-            }
-        })
-        .subscribe();
-
-      const commentSubscription = supabase
-        .channel('public:comments')
-        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'comments' }, payload => {
-            console.log('Comment insert received!', payload);
-            const newComment = payload.new;
-            setProjects(currentProjects => 
-                currentProjects.map(p => ({
-                    ...p,
-                    assets: p.assets?.map(asset => 
-                        asset.id === newComment.asset_id
-                        ? { ...asset, comments: [...(asset.comments || []), newComment] }
-                        : asset
-                    ) || []
-                }))
-            );
-            if (currentProject) {
-                const isRelevantProject = currentProject.assets.some(a => a.id === newComment.asset_id);
-                if (isRelevantProject) {
-                    setCurrentProject(p => ({
-                        ...p,
-                        assets: p.assets.map(asset => 
-                            asset.id === newComment.asset_id
-                            ? { ...asset, comments: [...(asset.comments || []), newComment] }
-                            : asset
-                        )
-                    }));
-                }
-            }
-        })
-        .subscribe();
-
-      return () => {
-        supabase.removeChannel(projectSubscription);
-        supabase.removeChannel(assetSubscription);
-        supabase.removeChannel(commentSubscription);
-      };
+  const fetchProjects = useCallback(async () => {
+    if (!user) return;
+    const { data, error } = await db.getProjects(user.id);
+    if (error) {
+      showNotification('Error loading projects', 'error');
+      console.error('Error loading projects:', error);
+    } else {
+      setProjects(data || []);
+      if (currentProject) {
+        const updatedCurrentProject = data.find(p => p.id === currentProject.id);
+        setCurrentProject(updatedCurrentProject || null);
+      }
     }
-  }, [user, currentProject]);
+  }, [user, currentProject?.id]);
 
+  useEffect(() => {
+    fetchProjects();
+
+    const handleUpdates = (payload) => {
+      console.log('Change received!', payload);
+      fetchProjects(); // Refetch all data on any change
+    };
+
+    const projectsChannel = supabase.channel('public:projects').on('postgres_changes', { event: '*', schema: 'public', table: 'projects' }, handleUpdates).subscribe();
+    const assetsChannel = supabase.channel('public:assets').on('postgres_changes', { event: '*', schema: 'public', table: 'assets' }, handleUpdates).subscribe();
+    const commentsChannel = supabase.channel('public:comments').on('postgres_changes', { event: '*', schema: 'public', table: 'comments' }, handleUpdates).subscribe();
+    const approvalsChannel = supabase.channel('public:approvals').on('postgres_changes', { event: '*', schema: 'public', table: 'approvals' }, handleUpdates).subscribe();
+    
+    // Fallback polling every 30 seconds
+    const interval = setInterval(fetchProjects, 30000);
+
+    return () => {
+      supabase.removeChannel(projectsChannel);
+      supabase.removeChannel(assetsChannel);
+      supabase.removeChannel(commentsChannel);
+      supabase.removeChannel(approvalsChannel);
+      clearInterval(interval);
+    };
+  }, [user, fetchProjects]);
 
   const createProject = async (newProjectData) => {
     if (!newProjectData.name.trim() || !newProjectData.client.trim() || !user) return;
-    
     try {
-      const projectData = {
+      await db.createProject({
         name: newProjectData.name.trim(),
         client_company: newProjectData.client.trim(),
         agency_user_id: user.id,
         due_date: newProjectData.dueDate || null,
         status: 'setup'
-      };
-
-      const { error } = await db.createProject(projectData);
-      if (error) throw error;
-      
+      });
       setShowNewProjectModal(false);
       showNotification('Project created successfully!');
+      // Real-time will update the list
     } catch (error) {
-      console.error('Error creating project:', error);
-      showNotification('Error creating project. Please try again.', 'error');
+      showNotification('Error creating project.', 'error');
     }
   };
 
   const updateProjectStatus = async (projectId, newStatus) => {
     try {
-      const { error } = await db.updateProjectStatus(projectId, newStatus);
-      if (error) throw error;
-      
-      // Optimistic update for immediate UI feedback
-      const updater = (p) => p.id === projectId ? { ...p, status: newStatus } : p;
-      setProjects(prev => prev.map(updater));
-      if (currentProject?.id === projectId) {
-        setCurrentProject(prev => ({ ...prev, status: newStatus }));
-      }
-
+      await db.updateProjectStatus(projectId, newStatus);
       showNotification('Project status updated.');
+      // Real-time will update the UI
     } catch (error) {
-      console.error('Error updating project status:', error);
       showNotification('Error updating project status.', 'error');
     }
   };
@@ -207,8 +143,7 @@ function App() {
       setShowShareModal(false);
       setProjectToShare(null);
     } catch (error) {
-      console.error('Error generating client link:', error);
-      showNotification('Error generating link. Please try again.', 'error');
+      showNotification('Error generating link.', 'error');
     }
   };
 
@@ -221,11 +156,7 @@ function App() {
   };
 
   if (loading) {
-    return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-        <div className="animate-spin rounded-full h-32 w-32 border-b-2 border-blue-600"></div>
-      </div>
-    );
+    return <div className="min-h-screen bg-gray-50 flex items-center justify-center"><div className="animate-spin rounded-full h-32 w-32 border-b-2 border-blue-600"></div></div>;
   }
 
   if (isClientReview) {
@@ -240,8 +171,10 @@ function App() {
     const colors = {
       'setup': 'bg-gray-100 text-gray-800',
       'in-progress': 'bg-blue-100 text-blue-800',
+      'filming': 'bg-indigo-100 text-indigo-800',
+      'editing': 'bg-purple-100 text-purple-800',
       'in-review': 'bg-yellow-100 text-yellow-800',
-      'revisions': 'bg-purple-100 text-purple-800',
+      'revisions': 'bg-orange-100 text-orange-800',
       'completed': 'bg-green-100 text-green-800',
       'cancelled': 'bg-red-100 text-red-800',
     };
@@ -256,23 +189,12 @@ function App() {
           <p className="text-gray-600">Welcome back, {user.user_metadata?.full_name || user.email}</p>
         </div>
         <div className="flex gap-2">
-          <button 
-            onClick={() => setShowNewProjectModal(true)}
-            className="bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-blue-700 transition-colors"
-          >
-            <Plus size={16} /> New Project
-          </button>
-          <button 
-            onClick={handleSignOut}
-            className="bg-gray-200 text-gray-800 px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-gray-300 transition-colors"
-          >
-            <LogOut size={16} /> Sign Out
-          </button>
+          <button onClick={() => setShowNewProjectModal(true)} className="bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-blue-700 transition-colors"><Plus size={16} /> New Project</button>
+          <button onClick={handleSignOut} className="bg-gray-200 text-gray-800 px-4 py-2 rounded-lg flex items-center gap-2 hover:bg-gray-300 transition-colors"><LogOut size={16} /> Sign Out</button>
         </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        {/* Stats Cards */}
         <div className="bg-white p-4 rounded-lg border"><div className="flex items-center gap-2"><Clock className="text-yellow-500" size={20} /><span className="text-sm text-gray-600">Active Projects</span></div><div className="text-2xl font-bold text-gray-900">{projects.filter(p => p.status !== 'completed' && p.status !== 'cancelled').length}</div></div>
         <div className="bg-white p-4 rounded-lg border"><div className="flex items-center gap-2"><FileText className="text-blue-500" size={20} /><span className="text-sm text-gray-600">Total Assets</span></div><div className="text-2xl font-bold text-gray-900">{projects.reduce((acc, p) => acc + (p.assets?.length || 0), 0)}</div></div>
         <div className="bg-white p-4 rounded-lg border"><div className="flex items-center gap-2"><CheckCircle className="text-green-500" size={20} /><span className="text-sm text-gray-600">Completed</span></div><div className="text-2xl font-bold text-gray-900">{projects.filter(p => p.status === 'completed').length}</div></div>
@@ -292,7 +214,7 @@ function App() {
                     <h4 className="font-medium text-lg text-gray-800">{project.name}</h4>
                     <p className="text-sm text-gray-600">{project.client_company}</p>
                     <div className="mt-2 flex items-center gap-2 flex-wrap">
-                      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(project.status)}`}>{project.status.replace('-', ' ')}</span>
+                      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(project.status)}`}>{project.status.replace(/_/g, ' ')}</span>
                       <span className="text-xs text-gray-500">{project.assets?.length || 0} asset(s)</span>
                       {project.due_date && <span className="text-xs text-gray-500">Due: {new Date(project.due_date).toLocaleDateString()}</span>}
                     </div>
@@ -354,7 +276,7 @@ function App() {
                     )}
                     <div className="flex gap-4 mt-2">
                       <a href={asset.file_url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:text-blue-800 text-sm flex items-center gap-1"><Eye size={14} /> Preview</a>
-                      <a href={asset.file_url} download className="text-blue-600 hover:text-blue-800 text-sm flex items-center gap-1"><Download size={14} /> Download</a>
+                      <a href={asset.file_url} download target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:text-blue-800 text-sm flex items-center gap-1"><Download size={14} /> Download</a>
                     </div>
                   </div>
                   <div>
@@ -425,7 +347,10 @@ function App() {
       {showFileUpload && currentProject && (
         <FileUpload
           projectId={currentProject.id}
-          onAssetCreated={() => showNotification('Asset uploaded successfully!')}
+          onAssetCreated={() => {
+            showNotification('Asset uploaded successfully!');
+            fetchProjects(); // Manually refetch after upload
+          }}
           onClose={() => setShowFileUpload(false)}
           showNotification={showNotification}
         />

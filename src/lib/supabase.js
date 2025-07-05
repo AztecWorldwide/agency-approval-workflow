@@ -1,3 +1,4 @@
+// src/lib/supabase.js
 import { createClient } from '@supabase/supabase-js';
 
 const supabaseUrl = process.env.REACT_APP_SUPABASE_URL;
@@ -6,100 +7,114 @@ const supabaseAnonKey = process.env.REACT_APP_SUPABASE_ANON_KEY;
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 // =============================================
-// RLS POLICIES EXAMPLES (add these in your Supabase dashboard)
+// RLS & RPC FUNCTION EXAMPLES (add these in your Supabase SQL Editor)
 // =============================================
-//
-// -- Enable RLS for all tables
-// ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
-// ALTER TABLE assets ENABLE ROW LEVEL SECURITY;
-// ALTER TABLE comments ENABLE ROW LEVEL SECURITY;
-// ALTER TABLE approvals ENABLE ROW LEVEL SECURITY;
-// ALTER TABLE project_stakeholders ENABLE ROW LEVEL SECURITY;
-//
-// -- PROJECTS TABLE
-// -- Allow users to see and manage their own projects
-// CREATE POLICY "Users can manage their own projects"
-// ON projects FOR ALL
-// USING (auth.uid() = agency_user_id);
-//
-// -- ASSETS TABLE
-// -- Allow users to manage assets for projects they own
-// CREATE POLICY "Users can manage assets in their projects"
-// ON assets FOR ALL
-// USING (
-//   (SELECT agency_user_id FROM projects WHERE id = assets.project_id) = auth.uid()
-// );
-//
-// -- COMMENTS TABLE
-// -- Allow users to manage comments in projects they own
-// CREATE POLICY "Users can manage comments in their projects"
-// ON comments FOR ALL
-// USING (
-//   (SELECT agency_user_id FROM projects WHERE id = (SELECT project_id FROM assets WHERE id = comments.asset_id)) = auth.uid()
-// );
-//
-// -- PROJECT_STAKEHOLDERS TABLE
-// -- Allow users to manage stakeholders for their own projects
-// CREATE POLICY "Users can manage stakeholders for their projects"
-// ON project_stakeholders FOR ALL
-// USING (
-//   (SELECT agency_user_id FROM projects WHERE id = project_stakeholders.project_id) = auth.uid()
-// );
-//
-// -- POLICIES FOR CLIENT REVIEW ACCESS (MORE COMPLEX)
-// -- This requires a custom function to verify the token.
-//
-// -- 1. Create a function to verify a stakeholder token
-// CREATE OR REPLACE FUNCTION is_stakeholder(p_project_id uuid, p_access_token text)
-// RETURNS boolean AS $$
-// BEGIN
-//   RETURN EXISTS (
-//     SELECT 1 FROM project_stakeholders
-//     WHERE project_id = p_project_id AND access_token = p_access_token
-//   );
-// END;
-// $$ LANGUAGE plpgsql SECURITY DEFINER;
-//
-// -- 2. Create policies that use this function for read access
-// -- For projects table
-// CREATE POLICY "Stakeholders can view their assigned projects"
-// ON projects FOR SELECT
-// USING (is_stakeholder(id, (SELECT current_setting('request.headers', true)::json->>'x-access-token')));
-//
-// -- For assets table
-// CREATE POLICY "Stakeholders can view assets in their assigned projects"
-// ON assets FOR SELECT
-// USING (is_stakeholder(project_id, (SELECT current_setting('request.headers', true)::json->>'x-access-token')));
-//
-// -- For comments table
-// CREATE POLICY "Stakeholders can view comments in their assigned projects"
-// ON comments FOR SELECT
-// USING (is_stakeholder((SELECT project_id FROM assets WHERE id = comments.asset_id), (SELECT current_setting('request.headers', true)::json->>'x-access-token')));
-//
-// -- For approvals table
-// CREATE POLICY "Stakeholders can view approvals in their assigned projects"
-// ON approvals FOR SELECT
-// USING (is_stakeholder((SELECT project_id FROM assets WHERE id = approvals.asset_id), (SELECT current_setting('request.headers', true)::json->>'x-access-token')));
-//
-// -- For writing comments/approvals (requires a more complex setup, often with Edge Functions or RPC calls)
-// -- A simplified RLS policy for inserts:
-// CREATE POLICY "Stakeholders can insert comments and approvals"
-// ON comments FOR INSERT
-// WITH CHECK (is_stakeholder((SELECT project_id FROM assets WHERE id = comments.asset_id), (SELECT current_setting('request.headers', true)::json->>'x-access-token')));
-//
-// CREATE POLICY "Stakeholders can manage their own approvals"
-// ON approvals FOR ALL
-// USING (
-//   (SELECT id FROM project_stakeholders WHERE project_id = (SELECT project_id FROM assets WHERE id = approvals.asset_id) AND access_token = (SELECT current_setting('request.headers', true)::json->>'x-access-token')) = stakeholder_id
-// );
-//
+/*
+-- 1. Enable RLS for all relevant tables
+ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE assets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE comments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE approvals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE project_stakeholders ENABLE ROW LEVEL SECURITY;
+
+-- 2. Create policies for authenticated agency users
+CREATE POLICY "Allow full access to own projects" ON projects FOR ALL USING (auth.uid() = agency_user_id) WITH CHECK (auth.uid() = agency_user_id);
+CREATE POLICY "Allow full access to own assets" ON assets FOR ALL USING ((SELECT agency_user_id FROM projects WHERE id = assets.project_id) = auth.uid());
+CREATE POLICY "Allow full access to own comments" ON comments FOR ALL USING (auth.uid() IN (SELECT p.agency_user_id FROM projects p JOIN assets a ON p.id = a.project_id WHERE a.id = comments.asset_id));
+CREATE POLICY "Allow full access to own approvals" ON approvals FOR ALL USING (auth.uid() IN (SELECT p.agency_user_id FROM projects p JOIN assets a ON p.id = a.project_id WHERE a.id = approvals.asset_id));
+CREATE POLICY "Allow full access to own stakeholders" ON project_stakeholders FOR ALL USING (auth.uid() IN (SELECT agency_user_id FROM projects WHERE id = project_stakeholders.project_id));
+
+-- 3. Create RPC function for secure client review data fetching
+CREATE OR REPLACE FUNCTION get_project_for_review(p_project_id uuid, p_access_token text)
+RETURNS json AS $$
+DECLARE
+    stakeholder_info record;
+    project_info json;
+BEGIN
+    -- Find the stakeholder using the provided token and project ID
+    SELECT * INTO stakeholder_info
+    FROM project_stakeholders
+    WHERE project_id = p_project_id AND access_token = p_access_token;
+
+    -- If no stakeholder is found, raise an exception
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Invalid access token or project ID';
+    END IF;
+
+    -- If stakeholder is found, fetch the project data
+    SELECT json_build_object(
+        'project', (SELECT row_to_json(p) FROM projects p WHERE id = p_project_id),
+        'stakeholder', row_to_json(stakeholder_info)
+    ) INTO project_info;
+
+    -- Fetch assets and their related comments/approvals
+    UPDATE project_info
+    SET project = jsonb_set(
+        project_info->'project',
+        '{assets}',
+        (SELECT jsonb_agg(
+            jsonb_build_object(
+                'id', a.id,
+                'name', a.name,
+                'description', a.description,
+                'file_url', a.file_url,
+                'file_type', a.file_type,
+                'file_size', a.file_size,
+                'created_at', a.created_at,
+                'comments', (SELECT jsonb_agg(c) FROM comments c WHERE c.asset_id = a.id),
+                'approvals', (SELECT jsonb_agg(ap) FROM approvals ap WHERE ap.asset_id = a.id)
+            )
+        ) FROM assets a WHERE a.project_id = p_project_id)
+    );
+
+    RETURN project_info;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 4. Create RPC function for secure client feedback submission
+CREATE OR REPLACE FUNCTION submit_client_feedback(
+    p_asset_id uuid,
+    p_stakeholder_id uuid,
+    p_access_token text,
+    p_status text,
+    p_feedback text
+)
+RETURNS void AS $$
+DECLARE
+    v_project_id uuid;
+BEGIN
+    -- Verify stakeholder token is valid for the asset's project
+    SELECT project_id INTO v_project_id FROM assets WHERE id = p_asset_id;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM project_stakeholders
+        WHERE id = p_stakeholder_id AND project_id = v_project_id AND access_token = p_access_token
+    ) THEN
+        RAISE EXCEPTION 'Invalid stakeholder credentials';
+    END IF;
+
+    -- Insert comment if feedback is provided
+    IF p_feedback IS NOT NULL AND p_feedback <> '' THEN
+        INSERT INTO comments (asset_id, stakeholder_id, author_type, content, author_name, author_email)
+        SELECT p_asset_id, p_stakeholder_id, 'client', p_feedback, name, email
+        FROM project_stakeholders WHERE id = p_stakeholder_id;
+    END IF;
+
+    -- Upsert approval
+    INSERT INTO approvals (asset_id, stakeholder_id, status, feedback)
+    VALUES (p_asset_id, p_stakeholder_id, p_status, p_feedback)
+    ON CONFLICT (asset_id, stakeholder_id)
+    DO UPDATE SET status = p_status, feedback = p_feedback, updated_at = now();
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+*/
 // =============================================
 
 export const auth = supabase.auth;
 
 export const db = {
   // Projects
-  getProjects: async (userId) => {
+  getProjects: (userId) => {
     return supabase
       .from('projects')
       .select(`*, assets(*, approvals(*), comments(*))`)
@@ -107,18 +122,8 @@ export const db = {
       .order('created_at', { ascending: false });
   },
 
-  getProjectForReview: async (projectId) => {
-    // This query assumes RLS policies are in place to grant access
-    // based on a stakeholder token passed in headers or via an Edge Function.
-    return supabase
-      .from('projects')
-      .select(`*, assets(*, approvals(*), comments(*))`)
-      .eq('id', projectId)
-      .single();
-  },
-
   createProject: (projectData) => {
-    return supabase.from('projects').insert([projectData]).select();
+    return supabase.from('projects').insert([projectData]);
   },
 
   updateProjectStatus: (projectId, status) => {
@@ -130,12 +135,12 @@ export const db = {
     return supabase.from('assets').insert([assetData]).select();
   },
 
-  // Comments
+  // Comments (for agency user)
   addComment: (commentData) => {
     return supabase.from('comments').insert([commentData]);
   },
 
-  // Stakeholders & Approvals
+  // Stakeholders & Client Review
   createStakeholder: (projectId, { name, email, role }) => {
     const accessToken = crypto.randomUUID();
     return supabase.from('project_stakeholders').insert([{
@@ -148,25 +153,20 @@ export const db = {
     }]).select();
   },
   
-  getStakeholderByToken: (projectId, accessToken) => {
-    return supabase
-      .from('project_stakeholders')
-      .select('*')
-      .eq('project_id', projectId)
-      .eq('access_token', accessToken)
-      .single();
+  getProjectForReview: (projectId, accessToken) => {
+    return supabase.rpc('get_project_for_review', {
+      p_project_id: projectId,
+      p_access_token: accessToken
+    });
   },
 
-  setApproval: (assetId, stakeholderId, status, feedback) => {
-    return supabase
-      .from('approvals')
-      .upsert({
-        asset_id: assetId,
-        stakeholder_id: stakeholderId,
-        status: status,
-        feedback: feedback?.trim() || null,
-      }, {
-        onConflict: 'asset_id, stakeholder_id'
-      });
+  submitClientFeedback: (assetId, stakeholderId, accessToken, status, feedback) => {
+    return supabase.rpc('submit_client_feedback', {
+      p_asset_id: assetId,
+      p_stakeholder_id: stakeholderId,
+      p_access_token: accessToken,
+      p_status: status,
+      p_feedback: feedback
+    });
   }
 };
