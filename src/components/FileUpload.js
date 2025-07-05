@@ -1,3 +1,4 @@
+// src/components/FileUpload.js
 import React, { useState, useCallback } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { Upload, File } from 'lucide-react';
@@ -21,6 +22,13 @@ const FileUpload = ({ projectId, onAssetCreated, onClose, showNotification }) =>
     }
   }, [assetDetails.name]);
   
+  const handleDetailsChange = (field, value) => {
+    setAssetDetails(prev => ({
+      ...prev,
+      [field]: value
+    }));
+  };
+
   const handleUpload = async () => {
     if (!fileToUpload) {
       showNotification('Please select a file to upload.', 'error');
