@@ -17,7 +17,6 @@ const ClientReview = ({ projectId, accessToken, onBack }) => {
 
   const loadProject = async () => {
     try {
-      // Verify access token and get stakeholder info
       const { data: stakeholderData, error: stakeholderError } = await supabase
         .from('project_stakeholders')
         .select('*')
@@ -31,7 +30,6 @@ const ClientReview = ({ projectId, accessToken, onBack }) => {
 
       setStakeholder(stakeholderData);
 
-      // Load project with assets and comments
       const { data, error } = await supabase
         .from('projects')
         .select(`
@@ -58,7 +56,6 @@ const ClientReview = ({ projectId, accessToken, onBack }) => {
   const handleApproval = async (assetId, status) => {
     setSubmitting(true);
     try {
-      // Add feedback comment if provided
       if (feedback[assetId]?.trim()) {
         const { error: commentError } = await supabase
           .from('comments')
@@ -73,7 +70,6 @@ const ClientReview = ({ projectId, accessToken, onBack }) => {
         if (commentError) throw commentError;
       }
 
-      // Create or update approval record
       const { error: approvalError } = await supabase
         .from('approvals')
         .upsert([{
@@ -86,7 +82,6 @@ const ClientReview = ({ projectId, accessToken, onBack }) => {
 
       if (approvalError) throw approvalError;
 
-      // Update local state
       setProject(prev => ({
         ...prev,
         assets: prev.assets.map(asset =>
@@ -119,7 +114,6 @@ const ClientReview = ({ projectId, accessToken, onBack }) => {
         )
       }));
 
-      // Clear feedback for this asset
       setFeedback(prev => ({
         ...prev,
         [assetId]: ''
@@ -176,7 +170,6 @@ const ClientReview = ({ projectId, accessToken, onBack }) => {
 
   return (
     <div className="min-h-screen bg-gray-50">
-      {/* Header */}
       <div className="bg-white border-b">
         <div className="max-w-4xl mx-auto px-6 py-4">
           <div className="flex items-center justify-between">
@@ -197,7 +190,6 @@ const ClientReview = ({ projectId, accessToken, onBack }) => {
         </div>
       </div>
 
-      {/* Content */}
       <div className="max-w-4xl mx-auto px-6 py-8">
         {project.assets && project.assets.length > 0 ? (
           <div className="space-y-8">
@@ -225,7 +217,6 @@ const ClientReview = ({ projectId, accessToken, onBack }) => {
                     )}
                   </div>
 
-                  {/* Asset Display */}
                   {asset.file_type === 'image' && asset.file_url && (
                     <div className="mb-6">
                       <div className="border rounded-lg p-4 bg-gray-50">
@@ -237,7 +228,7 @@ const ClientReview = ({ projectId, accessToken, onBack }) => {
                         />
                       </div>
                       <div className="flex gap-2 mt-2">
-                        
+                        <a
                           href={asset.file_url}
                           target="_blank"
                           rel="noopener noreferrer"
@@ -245,7 +236,7 @@ const ClientReview = ({ projectId, accessToken, onBack }) => {
                         >
                           <Eye size={14} /> View Full Size
                         </a>
-                        
+                        <a
                           href={asset.file_url}
                           download
                           className="text-blue-600 hover:text-blue-800 flex items-center gap-1 text-sm"
@@ -256,7 +247,48 @@ const ClientReview = ({ projectId, accessToken, onBack }) => {
                     </div>
                   )}
 
-                  {/* Feedback Section */}
+                  {asset.file_type !== 'image' && asset.file_url && (
+                    <div className="mb-6 p-4 bg-gray-50 rounded border">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="font-medium">{asset.name}</p>
+                          <p className="text-sm text-gray-500">
+                            {asset.file_type} • {asset.file_size ? (asset.file_size / 1024 / 1024).toFixed(2) + ' MB' : 'Unknown size'}
+                          </p>
+                        </div>
+                        <a
+                          href={asset.file_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700"
+                        >
+                          Open File
+                        </a>
+                      </div>
+                    </div>
+                  )}
+
+                  {asset.comments && asset.comments.length > 0 && (
+                    <div className="mb-6">
+                      <h3 className="font-medium mb-3">Comments:</h3>
+                      <div className="space-y-2">
+                        {asset.comments.map(comment => (
+                          <div key={comment.id} className={`p-3 rounded ${
+                            comment.author_type === 'client' ? 'bg-blue-50' : 'bg-gray-50'
+                          }`}>
+                            <div className="flex justify-between items-start mb-1">
+                              <span className="font-medium text-sm">{comment.author_name}</span>
+                              <span className="text-xs text-gray-500">
+                                {new Date(comment.created_at).toLocaleDateString()}
+                              </span>
+                            </div>
+                            <p className="text-sm">{comment.content}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   <div className="mb-6">
                     <label className="block text-sm font-medium text-gray-700 mb-2">
                       Your Feedback (Optional):
@@ -270,7 +302,6 @@ const ClientReview = ({ projectId, accessToken, onBack }) => {
                     />
                   </div>
 
-                  {/* Action Buttons */}
                   <div className="flex gap-3">
                     <button
                       onClick={() => handleApproval(asset.id, 'approved')}
@@ -293,6 +324,12 @@ const ClientReview = ({ projectId, accessToken, onBack }) => {
                     >
                       <XCircle size={16} /> REJECT
                     </button>
+                  </div>
+
+                  <div className="mt-6 p-3 bg-blue-50 rounded border-l-4 border-blue-500">
+                    <p className="text-sm text-blue-700">
+                      🔒 This review is secure and confidential. Only authorized stakeholders can access this content.
+                    </p>
                   </div>
                 </div>
               );

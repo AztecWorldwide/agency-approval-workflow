@@ -56,7 +56,10 @@ function App() {
     }
   };
 
-    // Listen for auth changes
+  // Listen for auth changes (only for normal app, not client review)
+  useEffect(() => {
+    if (isClientReview) return;
+
     const { data: { subscription } } = auth.onAuthStateChange((event, session) => {
       setUser(session?.user || null);
       if (session?.user) {
@@ -67,7 +70,7 @@ function App() {
     });
 
     return () => subscription.unsubscribe();
-  }, []);
+  }, [isClientReview]);
 
   // Load projects from database
   const loadProjects = async (userId) => {
