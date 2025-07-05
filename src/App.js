@@ -4,6 +4,7 @@ import { Upload, Eye, MessageCircle, Clock, CheckCircle, XCircle, Users, FileTex
 import { auth, db, storage, supabase } from './lib/supabase';
 import Auth from './components/Auth';
 import FileUpload from './components/FileUpload';
+import ClientReview from './components/ClientReview';
 
 function App() {
   const [user, setUser] = useState(null);
@@ -13,30 +14,47 @@ function App() {
   const [currentAsset, setCurrentAsset] = useState(null);
   const [showFileUpload, setShowFileUpload] = useState(false);
   
+  // Client review detection
+  const [isClientReview, setIsClientReview] = useState(false);
+  const [clientReviewData, setClientReviewData] = useState(null);
+  
   // Real data from database
   const [projects, setProjects] = useState([]);
-  const [newComment, setNewComment] = useState('');
+  const [commentInputs, setCommentInputs] = useState({}); // Store comments per asset
   const [newProject, setNewProject] = useState({ name: '', client: '', dueDate: '' });
   const [showNewProjectModal, setShowNewProjectModal] = useState(false);
 
-  // Check if user is logged in on app load
+  // Check for client review URL on app load
   useEffect(() => {
-    const checkUser = async () => {
-      try {
-        const { data: { user } } = await auth.getCurrentUser();
-        setUser(user);
-        
-        if (user) {
-          await loadProjects(user.id);
-        }
-      } catch (error) {
-        console.error('Error checking user:', error);
-      } finally {
-        setLoading(false);
-      }
-    };
+    const path = window.location.pathname;
+    const reviewMatch = path.match(/^\/review\/([^\/]+)\/([^\/]+)$/);
+    
+    if (reviewMatch) {
+      const [, projectId, accessToken] = reviewMatch;
+      setIsClientReview(true);
+      setClientReviewData({ projectId, accessToken });
+      setLoading(false);
+      return;
+    }
 
+    // Normal app authentication check
     checkUser();
+  }, []);
+
+  const checkUser = async () => {
+    try {
+      const { data: { user } } = await auth.getCurrentUser();
+      setUser(user);
+      
+      if (user) {
+        await loadProjects(user.id);
+      }
+    } catch (error) {
+      console.error('Error checking user:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
 
     // Listen for auth changes
     const { data: { subscription } } = auth.onAuthStateChange((event, session) => {
@@ -90,7 +108,7 @@ function App() {
 
   // Add comment to asset
   const addComment = async (assetId) => {
-    const commentText = newComment.trim();
+    const commentText = commentInputs[assetId]?.trim();
     if (!commentText || !user) return;
     
     try {
@@ -127,10 +145,48 @@ function App() {
         }));
       }
 
-      setNewComment('');
+      // Clear the specific comment input
+      setCommentInputs(prev => ({
+        ...prev,
+        [assetId]: ''
+      }));
     } catch (error) {
       console.error('Error adding comment:', error);
       alert('Error adding comment. Please try again.');
+    }
+  };
+
+  // Handle comment input change
+  const handleCommentChange = (assetId, value) => {
+    setCommentInputs(prev => ({
+      ...prev,
+      [assetId]: value
+    }));
+  };
+
+  // Update project status
+  const updateProjectStatus = async (projectId, newStatus) => {
+    try {
+      const { data, error } = await supabase
+        .from('projects')
+        .update({ status: newStatus })
+        .eq('id', projectId)
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      // Update local state
+      setProjects(prev => prev.map(project => 
+        project.id === projectId ? { ...project, status: newStatus } : project
+      ));
+
+      if (currentProject && currentProject.id === projectId) {
+        setCurrentProject(prev => ({ ...prev, status: newStatus }));
+      }
+    } catch (error) {
+      console.error('Error updating project status:', error);
+      alert('Error updating project status. Please try again.');
     }
   };
 
@@ -159,9 +215,25 @@ function App() {
       // Generate a secure token for client access
       const accessToken = Math.random().toString(36).substring(2) + Date.now().toString(36);
       
-      // In a real app, you'd save this token to the database
-      // For now, just create a link
-      const clientLink = `${window.location.origin}/client-review/${projectId}?token=${accessToken}`;
+      // Save the token to the database for verification
+      const { error } = await supabase
+        .from('project_stakeholders')
+        .insert([{
+          project_id: projectId,
+          email: 'client@placeholder.com', // In real app, get from form
+          name: 'Client Stakeholder',
+          role: 'Reviewer',
+          access_token: accessToken,
+          can_approve: true
+        }]);
+
+      if (error) {
+        console.error('Error creating access token:', error);
+        // Continue anyway with local token
+      }
+      
+      // Create client review link
+      const clientLink = `${window.location.origin}/review/${projectId}/${accessToken}`;
       
       // Copy to clipboard
       await navigator.clipboard.writeText(clientLink);
@@ -169,7 +241,8 @@ function App() {
     } catch (error) {
       console.error('Error generating client link:', error);
       // Fallback for browsers that don't support clipboard API
-      const clientLink = `${window.location.origin}/client-review/${projectId}?token=${Math.random().toString(36).substring(2)}`;
+      const accessToken = Math.random().toString(36).substring(2) + Date.now().toString(36);
+      const clientLink = `${window.location.origin}/review/${projectId}/${accessToken}`;
       prompt('Copy this link to share with your client:', clientLink);
     }
   };
@@ -197,9 +270,29 @@ function App() {
     );
   }
 
-  // Show auth form if not logged in
-  if (!user) {
+  // Show client review if accessed via review link
+  if (isClientReview && clientReviewData) {
+    return (
+      <ClientReview
+        projectId={clientReviewData.projectId}
+        accessToken={clientReviewData.accessToken}
+        onBack={() => {
+          setIsClientReview(false);
+          setClientReviewData(null);
+          window.history.pushState({}, '', '/');
+        }}
+      />
+    );
+  }
+
+  // Show auth form if not logged in (normal app access)
+  if (!user && !isClientReview) {
     return <Auth onAuthSuccess={setUser} />;
+  }
+
+  // Return early if in client review mode (handled above)
+  if (isClientReview) {
+    return null;
   }
 
   const getStatusColor = (status) => {
@@ -429,10 +522,23 @@ function App() {
           <div className="flex justify-between items-start">
             <div>
               <h2 className="text-lg font-semibold mb-4">Project Information</h2>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <div>
                   <span className="text-sm text-gray-500">Status</span>
-                  <p className="font-medium">{currentProject.status.replace('-', ' ')}</p>
+                  <select
+                    value={currentProject.status}
+                    onChange={(e) => updateProjectStatus(currentProject.id, e.target.value)}
+                    className="block w-full mt-1 border border-gray-300 rounded-md px-3 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    <option value="setup">Setup</option>
+                    <option value="in-progress">In Progress</option>
+                    <option value="filming">Filming</option>
+                    <option value="editing">Editing</option>
+                    <option value="in-review">In Review</option>
+                    <option value="revisions">Revisions</option>
+                    <option value="completed">Completed</option>
+                    <option value="cancelled">Cancelled</option>
+                  </select>
                 </div>
                 <div>
                   <span className="text-sm text-gray-500">Created</span>
@@ -444,6 +550,10 @@ function App() {
                     <p className="font-medium">{new Date(currentProject.due_date).toLocaleDateString()}</p>
                   </div>
                 )}
+                <div>
+                  <span className="text-sm text-gray-500">Assets</span>
+                  <p className="font-medium">{currentProject.assets?.length || 0}</p>
+                </div>
               </div>
             </div>
             <button
@@ -558,9 +668,10 @@ function App() {
                   {/* Add Comment */}
                   <div className="flex gap-2">
                     <input
+                      key={`comment-${asset.id}`}
                       type="text"
-                      value={newComment}
-                      onChange={(e) => setNewComment(e.target.value)}
+                      value={commentInputs[asset.id] || ''}
+                      onChange={(e) => handleCommentChange(asset.id, e.target.value)}
                       onKeyPress={(e) => {
                         if (e.key === 'Enter') {
                           addComment(asset.id);
@@ -571,7 +682,7 @@ function App() {
                     />
                     <button 
                       onClick={() => addComment(asset.id)}
-                      disabled={!newComment.trim()}
+                      disabled={!commentInputs[asset.id]?.trim()}
                       className="bg-blue-600 text-white px-4 py-2 rounded flex items-center gap-2 hover:bg-blue-700 disabled:opacity-50"
                     >
                       <Send size={14} /> Send
