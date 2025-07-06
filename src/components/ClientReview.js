@@ -1,3 +1,4 @@
+// src/components/ClientReview.js
 import React, { useState, useEffect, useCallback } from 'react';
 import { supabase, db } from '../lib/supabase';
 import Comments from './Comments';
@@ -18,7 +19,8 @@ const ClientReview = ({ projectId, accessToken }) => {
   };
 
   const loadProjectData = useCallback(async () => {
-    setLoading(true);
+    // Don't set loading to true on refetch, only on initial load
+    // setLoading(true); 
     try {
       const { data, error: rpcError } = await db.getProjectForReview(projectId, accessToken);
 

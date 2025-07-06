@@ -77,28 +77,30 @@ function App() {
   }, [user, currentProject?.id]);
 
   useEffect(() => {
-    fetchProjects();
+    if (user) {
+        fetchProjects();
 
-    const handleUpdates = (payload) => {
-      console.log('Change received!', payload);
-      fetchProjects(); // Refetch all data on any change
-    };
+        const handleUpdates = (payload) => {
+          console.log('Change received!', payload);
+          fetchProjects(); // Refetch all data on any change
+        };
 
-    const projectsChannel = supabase.channel('public:projects').on('postgres_changes', { event: '*', schema: 'public', table: 'projects' }, handleUpdates).subscribe();
-    const assetsChannel = supabase.channel('public:assets').on('postgres_changes', { event: '*', schema: 'public', table: 'assets' }, handleUpdates).subscribe();
-    const commentsChannel = supabase.channel('public:comments').on('postgres_changes', { event: '*', schema: 'public', table: 'comments' }, handleUpdates).subscribe();
-    const approvalsChannel = supabase.channel('public:approvals').on('postgres_changes', { event: '*', schema: 'public', table: 'approvals' }, handleUpdates).subscribe();
-    
-    // Fallback polling every 30 seconds
-    const interval = setInterval(fetchProjects, 30000);
+        const projectsChannel = supabase.channel('public:projects').on('postgres_changes', { event: '*', schema: 'public', table: 'projects' }, handleUpdates).subscribe();
+        const assetsChannel = supabase.channel('public:assets').on('postgres_changes', { event: '*', schema: 'public', table: 'assets' }, handleUpdates).subscribe();
+        const commentsChannel = supabase.channel('public:comments').on('postgres_changes', { event: '*', schema: 'public', table: 'comments' }, handleUpdates).subscribe();
+        const approvalsChannel = supabase.channel('public:approvals').on('postgres_changes', { event: '*', schema: 'public', table: 'approvals' }, handleUpdates).subscribe();
+        
+        // Fallback polling every 30 seconds
+        const interval = setInterval(fetchProjects, 30000);
 
-    return () => {
-      supabase.removeChannel(projectsChannel);
-      supabase.removeChannel(assetsChannel);
-      supabase.removeChannel(commentsChannel);
-      supabase.removeChannel(approvalsChannel);
-      clearInterval(interval);
-    };
+        return () => {
+          supabase.removeChannel(projectsChannel);
+          supabase.removeChannel(assetsChannel);
+          supabase.removeChannel(commentsChannel);
+          supabase.removeChannel(approvalsChannel);
+          clearInterval(interval);
+        };
+    }
   }, [user, fetchProjects]);
 
   const createProject = async (newProjectData) => {
@@ -349,7 +351,7 @@ function App() {
           projectId={currentProject.id}
           onAssetCreated={() => {
             showNotification('Asset uploaded successfully!');
-            fetchProjects(); // Manually refetch after upload
+            // Real-time will handle the update
           }}
           onClose={() => setShowFileUpload(false)}
           showNotification={showNotification}

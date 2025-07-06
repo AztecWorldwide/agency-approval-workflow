@@ -1,3 +1,4 @@
+// src/components/Comments.js
 import React, { useState } from 'react';
 import { db } from '../lib/supabase';
 import { Send, CheckCircle, XCircle, MessageCircle } from 'lucide-react';
