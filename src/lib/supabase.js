@@ -30,6 +30,7 @@ RETURNS json AS $$
 DECLARE
     stakeholder_info record;
     project_info json;
+    project_assets jsonb;
 BEGIN
     -- Find the stakeholder using the provided token and project ID
     SELECT * INTO stakeholder_info
@@ -41,35 +42,32 @@ BEGIN
         RAISE EXCEPTION 'Invalid access token or project ID';
     END IF;
 
-    -- If stakeholder is found, fetch the project data
+    -- Fetch assets and their related comments/approvals first
+    SELECT jsonb_agg(
+        jsonb_build_object(
+            'id', a.id,
+            'name', a.name,
+            'description', a.description,
+            'file_url', a.file_url,
+            'file_type', a.file_type,
+            'file_size', a.file_size,
+            'created_at', a.created_at,
+            'comments', (SELECT COALESCE(jsonb_agg(c ORDER BY c.created_at), '[]'::jsonb) FROM comments c WHERE c.asset_id = a.id),
+            'approvals', (SELECT COALESCE(jsonb_agg(ap), '[]'::jsonb) FROM approvals ap WHERE ap.asset_id = a.id)
+        )
+    ) INTO project_assets
+    FROM assets a WHERE a.project_id = p_project_id;
+
+    -- If stakeholder is found, fetch the project data and combine with assets
     SELECT json_build_object(
-        'project', (SELECT row_to_json(p) FROM projects p WHERE id = p_project_id),
+        'project', jsonb_set((SELECT row_to_json(p)::jsonb FROM projects p WHERE id = p_project_id), '{assets}', COALESCE(project_assets, '[]'::jsonb)),
         'stakeholder', row_to_json(stakeholder_info)
     ) INTO project_info;
-
-    -- Fetch assets and their related comments/approvals
-    UPDATE project_info
-    SET project = jsonb_set(
-        project_info->'project',
-        '{assets}',
-        (SELECT jsonb_agg(
-            jsonb_build_object(
-                'id', a.id,
-                'name', a.name,
-                'description', a.description,
-                'file_url', a.file_url,
-                'file_type', a.file_type,
-                'file_size', a.file_size,
-                'created_at', a.created_at,
-                'comments', (SELECT jsonb_agg(c) FROM comments c WHERE c.asset_id = a.id),
-                'approvals', (SELECT jsonb_agg(ap) FROM approvals ap WHERE ap.asset_id = a.id)
-            )
-        ) FROM assets a WHERE a.project_id = p_project_id)
-    );
 
     RETURN project_info;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
+
 
 -- 4. Create RPC function for secure client feedback submission
 CREATE OR REPLACE FUNCTION submit_client_feedback(
@@ -82,22 +80,23 @@ CREATE OR REPLACE FUNCTION submit_client_feedback(
 RETURNS void AS $$
 DECLARE
     v_project_id uuid;
+    stakeholder_info record;
 BEGIN
     -- Verify stakeholder token is valid for the asset's project
     SELECT project_id INTO v_project_id FROM assets WHERE id = p_asset_id;
 
-    IF NOT EXISTS (
-        SELECT 1 FROM project_stakeholders
-        WHERE id = p_stakeholder_id AND project_id = v_project_id AND access_token = p_access_token
-    ) THEN
+    SELECT * INTO stakeholder_info
+    FROM project_stakeholders
+    WHERE id = p_stakeholder_id AND project_id = v_project_id AND access_token = p_access_token;
+
+    IF NOT FOUND THEN
         RAISE EXCEPTION 'Invalid stakeholder credentials';
     END IF;
 
     -- Insert comment if feedback is provided
     IF p_feedback IS NOT NULL AND p_feedback <> '' THEN
         INSERT INTO comments (asset_id, stakeholder_id, author_type, content, author_name, author_email)
-        SELECT p_asset_id, p_stakeholder_id, 'client', p_feedback, name, email
-        FROM project_stakeholders WHERE id = p_stakeholder_id;
+        VALUES (p_asset_id, p_stakeholder_id, 'client', p_feedback, stakeholder_info.name, stakeholder_info.email);
     END IF;
 
     -- Upsert approval
